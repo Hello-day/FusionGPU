@@ -27,8 +27,9 @@ extern void run_gpu_batch_logic(
     int* top_id, float* top_dist, int* top_cnt,
     int bs, int tm, int rm, int final_k, float pr,
     float* d_list_cutoffs, float* d_thresholds, 
-    int* d_compact_offsets, // [New]
-    cudaStream_t s, BatchLogicEvents* events
+    int* d_compact_offsets,
+    cudaStream_t s, BatchLogicEvents* events,
+    int p1_lists, int limit_k, float threshold_coeff
 );
 
 extern void run_gpu_rerank(float* d_queries, int* d_top_ids, int* d_top_counts, float* d_base_vecs, int* d_final_ids, float* d_final_dists, int* d_stable_cnt, bool* d_finished, int batch_size, int rerank_m, int final_k, int total_vecs, int mini_batch_size, float epsilon, int beta, cudaStream_t stream);
@@ -81,7 +82,7 @@ class SearchPipeline {
         
         float* d_list_cutoffs = nullptr; 
         float* d_thresholds = nullptr;
-        int* d_compact_offsets = nullptr; // [New]
+        int* d_compact_offsets = nullptr;
 
         int* h_atomic_reader = nullptr; 
         int* h_total_max_reader = nullptr; 
@@ -97,7 +98,7 @@ class SearchPipeline {
             cudaEventCreate(&logic_events.evt_resize_sync);
             cudaEventCreate(&logic_events.evt_scan_phase1_end);
             cudaEventCreate(&logic_events.evt_scan_cand);
-            cudaEventCreate(&logic_events.evt_compact); // [New]
+            cudaEventCreate(&logic_events.evt_compact);
             cudaEventCreate(&logic_events.evt_sort);
             cudaEventCreate(&logic_events.evt_gather);
         }
@@ -119,6 +120,9 @@ class SearchPipeline {
     int batch_size, top_m, rerank_m, final_k;
     int mini_batch_size; float epsilon; int beta;
     float prune_ratio;
+    int p1_lists;           // Phase 1 密集搜索的聚类数量
+    int limit_k;            // 每个聚类内保留的候选数量
+    float threshold_coeff;  // Phase 2 阈值放宽系数
     IVFIndexGPU ivf_index;
     float* d_base_vecs = nullptr;
     int total_base_vecs;
@@ -145,9 +149,11 @@ class SearchPipeline {
 
 public:
     SearchPipeline(int b_size, int tm, int rm, IVFIndexGPU index, const float* raw_vecs, const char* cagra_path, 
-                   int total_queries, int total_base, int mb, float eps, int b, float pr, int n_streams = 2,int k_val = 10) 
+                   int total_queries, int total_base, int mb, float eps, int b, float pr, int n_streams = 2, int k_val = 10,
+                   int p1 = DEFAULT_P1_LISTS, int lk = DEFAULT_LIMIT_K, float tc = DEFAULT_THRESHOLD_COEFF) 
         : batch_size(b_size), top_m(tm), rerank_m(rm), mini_batch_size(mb), epsilon(eps), beta(b), prune_ratio(pr),
-          ivf_index(index), total_base_vecs(total_base), num_streams(n_streams),final_k(k_val)
+          ivf_index(index), total_base_vecs(total_base), num_streams(n_streams), final_k(k_val),
+          p1_lists(p1), limit_k(lk), threshold_coeff(tc)
     {
         cagra_idx_opt.emplace(load_cagra_index(raft_handle, cagra_path));
         final_results.resize(total_queries);
@@ -195,9 +201,10 @@ public:
             cudaMalloc(&ctx->d_stable_cnt, batch_size * sizeof(int));
             cudaMalloc(&ctx->d_finished, batch_size * sizeof(bool));
             
-            cudaMalloc(&ctx->d_list_cutoffs, batch_size * 8 * sizeof(float));
+            // 使用 p1_lists 参数分配内存
+            cudaMalloc(&ctx->d_list_cutoffs, batch_size * p1_lists * sizeof(float));
             cudaMalloc(&ctx->d_thresholds, batch_size * sizeof(float));
-            cudaMalloc(&ctx->d_compact_offsets, (batch_size + 1) * sizeof(int)); // [New]
+            cudaMalloc(&ctx->d_compact_offsets, (batch_size + 1) * sizeof(int));
             
             buffers.push_back(ctx); 
         }
@@ -334,7 +341,8 @@ public:
             c->d_top_ids, c->d_top_dists, c->d_top_counts, 
             c->current_batch_size, top_m, rerank_m, final_k, prune_ratio,
             c->d_list_cutoffs, c->d_thresholds, c->d_compact_offsets,
-            c->stream, &c->logic_events
+            c->stream, &c->logic_events,
+            p1_lists, limit_k, threshold_coeff
         );
         cudaEventRecord(c->evt_gpu_batch_end, c->stream);
         
@@ -498,8 +506,12 @@ int main(int argc, char** argv) {
     int batch_size = DEFAULT_BATCH_SIZE; int top_m = DEFAULT_TOP_M; int rerank_m = DEFAULT_RERANK_M;     
     int mini_batch_size = DEFAULT_RERANK_MINI_BATCH; float epsilon = DEFAULT_RERANK_EPSILON; int beta = DEFAULT_RERANK_BETA;
     float prune_ratio = 100.0f; 
-    int n_streams = 2; // 默认流数量
-    int final_k = 10; // 默认最终返回的top-k数量
+    int n_streams = 2;
+    int final_k = 10;
+    int p1_lists = DEFAULT_P1_LISTS;
+    int limit_k = DEFAULT_LIMIT_K;
+    float threshold_coeff = DEFAULT_THRESHOLD_COEFF;
+    
     for(int i=1; i<argc; ++i) {
         std::string arg = argv[i];
         if (arg == "-b" || arg == "--batch_size") { if(i+1 < argc) batch_size = std::atoi(argv[++i]); }
@@ -510,7 +522,10 @@ int main(int argc, char** argv) {
         else if (arg == "--beta") { if(i+1 < argc) beta = std::atoi(argv[++i]); }
         else if (arg == "-p" || arg == "--prune") { if(i+1 < argc) prune_ratio = std::atof(argv[++i]); } 
         else if (arg == "-s" || arg == "--streams") { if(i+1 < argc) n_streams = std::atoi(argv[++i]); }
-         else if (arg == "-k" || arg == "--topk") { if(i+1 < argc) final_k = std::atoi(argv[++i]); }
+        else if (arg == "-k" || arg == "--topk") { if(i+1 < argc) final_k = std::atoi(argv[++i]); }
+        else if (arg == "--p1_lists") { if(i+1 < argc) p1_lists = std::atoi(argv[++i]); }
+        else if (arg == "--limit_k") { if(i+1 < argc) limit_k = std::atoi(argv[++i]); }
+        else if (arg == "--threshold_coeff") { if(i+1 < argc) threshold_coeff = std::atof(argv[++i]); }
         else if (arg[0] != '-') {
             if (base_path.empty()) base_path = arg; else if (query_path.empty()) query_path = arg; else if (gt_file.empty()) gt_file = arg;
         }
@@ -525,8 +540,10 @@ int main(int argc, char** argv) {
     float* q_ptr; int nq = read_vecs<float>(query_path, q_ptr, DIM);
     std::vector<float> all_q(q_ptr, q_ptr + (size_t)nq * DIM);
     
-    // 初始化 Pipeline，传入 n_streams
-    SearchPipeline pipeline(batch_size, top_m, rerank_m, idx_gpu, raw, "../res/cagra_centroids.index", nq, n, mini_batch_size, epsilon, beta, prune_ratio, n_streams,final_k);
+    // 初始化 Pipeline，传入所有参数
+    SearchPipeline pipeline(batch_size, top_m, rerank_m, idx_gpu, raw, "../res/cagra_centroids.index", 
+                           nq, n, mini_batch_size, epsilon, beta, prune_ratio, n_streams, final_k,
+                           p1_lists, limit_k, threshold_coeff);
 
     // 预热
     {

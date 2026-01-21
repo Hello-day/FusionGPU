@@ -191,8 +191,11 @@ struct ElbowAnalysisResult {
     std::vector<float> marginal_gain;        // 边际增益 (一阶导数)
 };
 
-// 核心思想：找到累积覆盖率曲线的"膝盖点"
-// 即增长速度明显放缓的位置
+// ===== 改进版：带平滑和稳定性检测的拐点分析 =====
+// 核心改进：
+// 1. 高斯平滑消除尾部反弹噪声
+// 2. 稳定性检测惩罚波动
+// 3. 硬性停止条件避免过度搜索
 ElbowAnalysisResult find_elbow_point(const std::vector<int>& hits_per_list, int total_hits) {
     ElbowAnalysisResult result;
     int n = hits_per_list.size();
@@ -203,7 +206,7 @@ ElbowAnalysisResult find_elbow_point(const std::vector<int>& hits_per_list, int 
         return result;
     }
     
-    // 计算累积覆盖率和边际增益
+    // 1. 计算基础覆盖率和边际增益
     result.cumulative_coverage.resize(n);
     result.marginal_gain.resize(n);
     
@@ -214,57 +217,239 @@ ElbowAnalysisResult find_elbow_point(const std::vector<int>& hits_per_list, int 
         result.marginal_gain[i] = static_cast<float>(hits_per_list[i]) / total_hits;
     }
     
-    // ===== 方法: 基于边际增益衰减的拐点检测 =====
-    // 思路：前几个列表的边际增益很高，找到增益显著下降的点
-    
-    // 计算前几个列表的平均增益作为基准
-    int baseline_count = std::min(5, n);
-    float baseline_gain = 0.0f;
-    for (int i = 0; i < baseline_count; ++i) {
-        baseline_gain += result.marginal_gain[i];
+    // 2. 【关键步骤】先对数变换，再平滑处理
+    // 目的：对数变换将幂律分布转为线性，然后平滑消除噪声
+    std::vector<float> log_hits(n);
+    for (int i = 0; i < n; ++i) {
+        log_hits[i] = std::log(hits_per_list[i] + 1.0f);
     }
-    baseline_gain /= baseline_count;
     
-    // 找到边际增益下降到基准的某个比例的位置
-    // 同时使用滑动窗口平滑噪声
-    int window_size = 3;
-    result.elbow_point = n;
-    
-    for (int i = baseline_count; i < n - window_size + 1; ++i) {
-        // 计算窗口内的平均增益
-        float window_gain = 0.0f;
-        for (int j = 0; j < window_size; ++j) {
-            window_gain += result.marginal_gain[i + j];
+    // 3. 对对数数据进行高斯平滑 (Gaussian Smoothing)
+    std::vector<float> smoothed_log_hits(n);
+    for (int i = 0; i < n; ++i) {
+        if (i == 0 || i == n - 1) {
+            smoothed_log_hits[i] = log_hits[i];
+        } else {
+            // 3点加权平均 (0.25, 0.5, 0.25) - 抑制高频噪声
+            smoothed_log_hits[i] = 0.25f * log_hits[i-1] + 
+                                   0.50f * log_hits[i] + 
+                                   0.25f * log_hits[i+1];
         }
-        window_gain /= window_size;
+    }
+    
+    // 4. 基于平滑后的对数数据计算曲率
+    std::vector<float> curvature(n, 0.0f);
+    for (int i = 1; i + 1 < n; ++i) {
+        // 二阶导数
+        curvature[i] = smoothed_log_hits[i+1] - 2.0f * smoothed_log_hits[i] + smoothed_log_hits[i-1];
+    }
+    
+    // 5. 将平滑后的对数数据转回原始尺度（用于显示和计算下降率）
+    std::vector<float> smoothed_hits(n);
+    for (int i = 0; i < n; ++i) {
+        smoothed_hits[i] = std::exp(smoothed_log_hits[i]) - 1.0f;
+    }
+    
+    // 6. 计算局部波动性 (用于惩罚反弹)
+    // 检测每个位置本身是否是反弹点
+    // 基于原始数据检测，更敏感地捕捉反弹
+    std::vector<float> volatility(n, 0.0f);
+    for (int i = 1; i < n - 1; ++i) {
+        // 方法1：基于原始数据的一阶导数符号变化
+        float diff1 = (float)(hits_per_list[i-1] - hits_per_list[i]);
+        float diff2 = (float)(hits_per_list[i] - hits_per_list[i+1]);
         
-        // 当窗口增益下降到基准的 10% 以下时，认为是拐点
-        if (window_gain < baseline_gain * 0.1f) {
-            result.elbow_point = i;
-            break;
+        // 如果连续两次变化方向相反（一降一升，或一升一降），说明 i 是反弹点
+        if (diff1 * diff2 < 0) {
+            volatility[i] = 1.0f;
+        }
+    }
+    
+    // ===== 评分逻辑 =====
+    int best_elbow = -1;
+    float best_score = -1e9f;
+    
+    // 基础配置
+    const float MIN_COVERAGE = 0.60f;
+    float first_hits = (float)hits_per_list[0];
+    
+    // 打印表头
+    std::cout << "\n  拐点检测详细评分 (改进版：先对数后平滑):" << std::endl;
+    std::cout << "  " << std::string(140, '=') << std::endl;
+    
+    // 先显示所有List的命中分布（前30个）
+    std::cout << "  命中分布 (前30个列表):" << std::endl;
+    std::cout << "  " << std::string(140, '-') << std::endl;
+    int cumsum_display = 0;
+    for (int i = 0; i < std::min(30, n); ++i) {
+        cumsum_display += hits_per_list[i];
+        float coverage_display = static_cast<float>(cumsum_display) / total_hits * 100;
+        std::cout << "  List " << std::setw(2) << (i + 1) << ": " 
+                  << std::setw(5) << hits_per_list[i] << " hits, "
+                  << "累积覆盖: " << std::fixed << std::setprecision(1) << std::setw(5) << coverage_display << "%";
+        
+        // 如果这个List会参与评分，标记一下
+        if (i >= 2 && i < 30 && result.cumulative_coverage[i] >= MIN_COVERAGE) {
+            std::cout << "  ← 参与评分";
+        }
+        std::cout << std::endl;
+    }
+    
+    // 调试：输出List 10-15的详细数据
+    std::cout << "\n  [DEBUG] List 10-15 详细数据:" << std::endl;
+    std::cout << "  " << std::string(140, '-') << std::endl;
+    for (int i = 9; i < 15 && i < n; ++i) {
+        float current_growth = (float)hits_per_list[i] / total_hits;
+        float prev_growth = (float)hits_per_list[i-1] / total_hits;
+        float growth_ratio = (prev_growth > 0) ? (current_growth / prev_growth) : 0;
+        
+        std::cout << "  List " << (i+1) << ": "
+                  << "hits=" << hits_per_list[i] << ", "
+                  << "growth=" << std::fixed << std::setprecision(4) << current_growth << ", "
+                  << "prev_growth=" << prev_growth << ", "
+                  << "ratio=" << growth_ratio << ", "
+                  << "volatility=" << volatility[i] << ", "
+                  << "coverage=" << std::fixed << std::setprecision(2) << result.cumulative_coverage[i] * 100 << "%" << std::endl;
+    }
+    std::cout << std::endl;
+    
+    std::cout << "\n  候选拐点评分 (覆盖率≥60% | 硬性要求：覆盖率≥80%):" << std::endl;
+    std::cout << "  " << std::string(140, '=') << std::endl;
+    std::cout << "  List  Hits    Smoothed  Coverage  CurvScore  DropScore  EffBonus  VolPenalty  TotalScore  Status" << std::endl;
+    std::cout << "  " << std::string(140, '-') << std::endl;
+    
+    
+    // 搜索范围：从第3个开始，到覆盖率过高或列表数过多为止
+    for (int i = 2; i + 1 < n && i < 30; ++i) {
+        // --- 过滤条件 ---
+        if (result.cumulative_coverage[i] < MIN_COVERAGE) continue;
+        
+        // --- 评分项 ---
+        // A. 曲率得分 (使用平滑后的数据，绝对值)
+        // 平滑后，List 20 的反弹曲率会被大幅削弱
+        float curvature_score = std::abs(curvature[i]) * 10.0f;
+        
+        // B. 相对下降率 (使用原始数据，更真实反映实际变化)
+        float drop_before = (float)(hits_per_list[i-1] - hits_per_list[i]) / (hits_per_list[i-1] + 1.0f);
+        float drop_after  = (float)(hits_per_list[i] - hits_per_list[i+1]) / (hits_per_list[i] + 1.0f);
+        
+        // 理想拐点：前面降得快，后面降得慢（趋于0）
+        // 只有当后面降得比前面慢时才扣分
+        float drop_score = 0.0f;
+        if (drop_after < drop_before) {
+            // 后面降得比前面慢，这是拐点的特征
+            drop_score = (drop_before - drop_after) * 8.0f;
+        }
+        // 如果 drop_after >= drop_before，说明后面降得更快或一样快，不扣分（drop_score = 0）
+        
+        // C. 稳定性惩罚 (Stability Penalty)
+        // 检查拐点本身是否有波动
+        float local_volatility = volatility[i];
+        float volatility_penalty = local_volatility * 5.0f; // 发现反弹重罚
+        
+        // D. 效率奖励 (鼓励较小的列表数)
+        // 使用反向二次函数：前期平缓，后期陡峭
+        // bonus = max_bonus * (1 - (i / threshold)^2)
+        // 当 i < threshold 时，奖励下降缓慢
+        // 当 i > threshold 时，奖励快速归零
+        const float threshold = 32.0f;  // 阈值点
+        const float max_bonus = 4.0f;  // 最大奖励
+        float efficiency_bonus = 0.0f;
+        if (i < threshold) {
+            float ratio = (float)i / threshold;
+            efficiency_bonus = max_bonus * (1.0f - ratio * ratio);
+        } else {
+            // 超过阈值后，奖励快速衰减到0
+            float excess = (float)(i - threshold) / 10.0f;
+            efficiency_bonus = max_bonus * std::exp(-excess * excess);
         }
         
-        // 或者当累积覆盖率已经很高且增益很低时
-        if (result.cumulative_coverage[i] > 0.60f && window_gain < baseline_gain * 0.2f) {
-            result.elbow_point = i;
-            break;
+        // 总分
+        float score = curvature_score + drop_score + efficiency_bonus - volatility_penalty;
+        
+        // 打印详细评分（显示得分而不是原始值）
+        std::string status = "";
+        const float MIN_COVERAGE_HARD = 0.80f;
+        if (result.cumulative_coverage[i] < MIN_COVERAGE_HARD) {
+            status = "❌ 覆盖率<80%";
+        } else if (score > best_score) {
+            status = "🌟 当前最佳";
+        }
+        
+        std::cout << "  " << std::setw(4) << (i+1) << "  "
+                  << std::setw(6) << hits_per_list[i] << "  "
+                  << std::setw(8) << std::fixed << std::setprecision(1) << smoothed_hits[i] << "  "
+                  << std::setw(7) << std::fixed << std::setprecision(1) << result.cumulative_coverage[i]*100 << "%  "
+                  << std::setw(10) << std::fixed << std::setprecision(2) << curvature_score << "  "
+                  << std::setw(10) << std::fixed << std::setprecision(2) << drop_score << "  "
+                  << std::setw(9) << std::fixed << std::setprecision(2) << efficiency_bonus << "  "
+                  << std::setw(11) << std::fixed << std::setprecision(2) << volatility_penalty << "  "
+                  << std::setw(10) << std::fixed << std::setprecision(2) << score << "  "
+                  << status << std::endl;
+        
+        // 只有覆盖率 >= 80% 的点才参与最佳点选择
+        if (result.cumulative_coverage[i] >= MIN_COVERAGE_HARD && score > best_score) {
+            best_score = score;
+            best_elbow = i;
         }
     }
     
-    // 确保拐点至少覆盖 60% 的命中
-    while (result.elbow_point > 1 && 
-           result.cumulative_coverage[result.elbow_point - 1] < 0.60f) {
-        result.elbow_point++;
-    }
+    std::cout << "  " << std::string(140, '=') << std::endl;
     
-    // 限制最大值，不超过 P98 的合理范围
-    result.elbow_point = std::min(result.elbow_point, n);
-    
-    if (result.elbow_point > 0 && result.elbow_point <= n) {
-        result.coverage_at_elbow = result.cumulative_coverage[result.elbow_point - 1];
+    // 返回结果
+    if (best_elbow >= 0) {
+        result.elbow_point = best_elbow + 1;
+        result.coverage_at_elbow = result.cumulative_coverage[best_elbow];
+        
+        // 打印详细的评分分解
+        std::cout << "\n  ✅ 检测到最佳Elbow点: List " << result.elbow_point << std::endl;
+        std::cout << "     覆盖率: " << std::fixed << std::setprecision(1) 
+                  << result.coverage_at_elbow * 100 << "%" << std::endl;
+        std::cout << "     最佳评分: " << std::fixed << std::setprecision(2) << best_score << std::endl;
+        
+        // 重新计算该点的各项评分以显示详情
+        float final_curvature_score = std::abs(curvature[best_elbow]) * 10.0f;
+        float final_drop_before = (float)(hits_per_list[best_elbow-1] - hits_per_list[best_elbow]) / (hits_per_list[best_elbow-1] + 1.0f);
+        float final_drop_after = (float)(hits_per_list[best_elbow] - hits_per_list[best_elbow+1]) / (hits_per_list[best_elbow] + 1.0f);
+        float final_valid_drop_after = std::max(0.0f, final_drop_after);
+        float final_drop_score = (final_drop_before - final_valid_drop_after) * 8.0f;
+        
+        // 使用相同的效率奖励公式（参数必须与循环中一致）
+        const float threshold = 32.0f;
+        const float max_bonus = 2.0f;
+        float final_efficiency = 0.0f;
+        if (best_elbow < threshold) {
+            float ratio = (float)best_elbow / threshold;
+            final_efficiency = max_bonus * (1.0f - ratio * ratio);
+        } else {
+            float excess = (float)(best_elbow - threshold) / 10.0f;
+            final_efficiency = max_bonus * std::exp(-excess * excess);
+        }
+        
+        float final_volatility = volatility[best_elbow];
+        float final_volatility_penalty = final_volatility * 5.0f;
+        
+        std::cout << "\n     评分明细:" << std::endl;
+        std::cout << "     - 曲率贡献:     " << std::fixed << std::setprecision(2) << final_curvature_score 
+                  << " (|" << std::fixed << std::setprecision(6) << std::abs(curvature[best_elbow]) << "| × 10.0)" << std::endl;
+        std::cout << "     - 下降率贡献:   " << std::fixed << std::setprecision(2) << final_drop_score 
+                  << " ((" << std::fixed << std::setprecision(3) << final_drop_before << " - " 
+                  << final_valid_drop_after << ") × 8.0)" << std::endl;
+        std::cout << "     - 效率奖励:     " << std::fixed << std::setprecision(2) << final_efficiency << std::endl;
+        std::cout << "     - 稳定性惩罚:   " << std::fixed << std::setprecision(2) << final_volatility_penalty 
+                  << " (波动次数: " << final_volatility << ")" << std::endl;
+        std::cout << "     - 总分:         " << std::fixed << std::setprecision(2) << best_score << std::endl;
+        
+        return result;
     } else {
-        result.elbow_point = 1;
-        result.coverage_at_elbow = result.cumulative_coverage[0];
+        // 兜底：找第一个满足最小覆盖率的点
+        for(int i=0; i<n; ++i) {
+            if(result.cumulative_coverage[i] >= MIN_COVERAGE) {
+                result.elbow_point = i+1;
+                result.coverage_at_elbow = result.cumulative_coverage[i];
+                break;
+            }
+        }
     }
     
     return result;
@@ -401,8 +586,9 @@ TuneResults tune_search_parameters(
     // 保存用于统计
     results.cluster_ranks = all_cluster_ranks;
     
-    // ===== 方法1: P98 分位数确定 RECOMMENDED_TOP_M =====
-    results.recommended_top_m = compute_percentile_int(all_cluster_ranks, config.p98_percentile);
+    // ===== 方法1: P99.5 分位数确定 RECOMMENDED_TOP_M =====
+    // 改为 P99.5 以获得更高的覆盖率保证
+    results.recommended_top_m = compute_percentile_int(all_cluster_ranks, 0.995f);
     
     // ===== 方法2: 拐点检测确定 RECOMMENDED_P1_LISTS =====
     // 统计每个列表位置的命中数
@@ -431,17 +617,6 @@ TuneResults tune_search_parameters(
     std::cout << "  [方法2] 拐点检测 (RECOMMENDED_P1_LISTS): " << results.recommended_p1_lists << std::endl;
     std::cout << "          拐点处覆盖率: " << std::fixed << std::setprecision(2) 
               << elbow_result.coverage_at_elbow * 100 << "%" << std::endl;
-    
-    // 打印前20个列表的命中分布
-    std::cout << "\n  列表命中分布 (前20):" << std::endl;
-    int cumsum = 0;
-    for (int i = 0; i < std::min(20, (int)hits_per_list.size()); ++i) {
-        cumsum += hits_per_list[i];
-        float coverage = static_cast<float>(cumsum) / total_hits * 100;
-        std::cout << "    List " << std::setw(2) << (i + 1) << ": " 
-                  << std::setw(5) << hits_per_list[i] << " hits, "
-                  << "累积覆盖: " << std::fixed << std::setprecision(1) << coverage << "%" << std::endl;
-    }
     
     // ===== 步骤 4: 分析 PQ 排序误差 (基于 P1_LISTS 内的 k 近邻) =====
     std::cout << "\n[4/4] 分析 PQ 排序误差 (仅统计前 " << results.recommended_p1_lists << " 个聚类)..." << std::endl;
@@ -640,8 +815,12 @@ TuneResults tune_search_parameters(
     std::cout << "  - RECOMMENDED_LIMIT_K: " << results.recommended_limit_k << std::endl;
     
     // ===== 计算 THRESHOLD_COEFF =====
-    // 逻辑：对于每个查询的每个 k 近邻，计算其 PQ 距离与其所在聚类第 LIMIT_K 名 PQ 距离的比值
-    // 只统计落在前 P1_LISTS 聚类中的 k 近邻
+    // 逻辑（与搜索代码一致）：
+    // 1. 对每个查询，计算前 P1_LISTS 个聚类的 cutoff（第 LIMIT_K 名 PQ 距离）
+    // 2. 取这些 cutoff 中的最小值作为该查询的基准 cutoff
+    // 3. 计算最远 k 近邻的 PQ 距离 / 基准 cutoff
+    // 4. 对所有查询的比值取最大值
+    // 搜索时阈值 = min(前 P1_LISTS 个聚类的 cutoff) * THRESHOLD_COEFF
     std::cout << "\n计算阈值系数 (基于 P1_LISTS=" << results.recommended_p1_lists 
               << ", LIMIT_K=" << results.recommended_limit_k << ")..." << std::endl;
     
@@ -659,37 +838,13 @@ TuneResults tune_search_parameters(
         }
         std::sort(cluster_dists.begin(), cluster_dists.end());
         
-        // 获取前 P1_LISTS 个聚类的 ID
-        std::set<int> p1_clusters;
-        for (int r = 0; r < std::min(results.recommended_p1_lists, n_clusters); ++r) {
-            p1_clusters.insert(cluster_dists[r].second);
-        }
+        // ===== 步骤1: 计算前 P1_LISTS 个聚类的 cutoff =====
+        std::vector<float> p1_cutoffs;
         
-        // 处理该查询的所有 K 个真实近邻
-        for (int k = 0; k < config.final_k; ++k) {
-            int true_id = gt_ids[i * config.final_k + k];
-            
-            // 找到 true_id 所属的聚类
-            int true_cluster = -1;
-            for (int c = 0; c < n_clusters; ++c) {
-                int start = cluster_offsets[c];
-                int end = cluster_offsets[c + 1];
-                for (int j = start; j < end; ++j) {
-                    if (vector_ids[j] == true_id) {
-                        true_cluster = c;
-                        break;
-                    }
-                }
-                if (true_cluster != -1) break;
-            }
-            
-            if (true_cluster == -1) continue;
-            
-            // 只统计落在前 P1_LISTS 聚类中的 k 近邻
-            if (p1_clusters.count(true_cluster) == 0) continue;
-            
-            int cluster_start = cluster_offsets[true_cluster];
-            int cluster_end = cluster_offsets[true_cluster + 1];
+        for (int r = 0; r < std::min(results.recommended_p1_lists, n_clusters); ++r) {
+            int c_id = cluster_dists[r].second;
+            int cluster_start = cluster_offsets[c_id];
+            int cluster_end = cluster_offsets[c_id + 1];
             int cluster_size = cluster_end - cluster_start;
             
             if (cluster_size == 0) continue;
@@ -706,7 +861,7 @@ TuneResults tune_search_parameters(
             cudaMalloc(&d_cluster_codes, cluster_size * PQ_M * sizeof(uint8_t));
             
             cudaMemcpy(d_query_single, query, DIM * sizeof(float), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_centroid_single, centroids + true_cluster * DIM, DIM * sizeof(float), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_centroid_single, centroids + c_id * DIM, DIM * sizeof(float), cudaMemcpyHostToDevice);
             cudaMemcpy(d_cluster_codes, pq_codes + cluster_start * PQ_M, 
                        cluster_size * PQ_M * sizeof(uint8_t), cudaMemcpyHostToDevice);
             
@@ -729,30 +884,94 @@ TuneResults tune_search_parameters(
             cudaFree(d_pq_dists);
             cudaFree(d_cluster_codes);
             
-            // 找到 true_id 的 PQ 距离
-            float true_pq_dist = -1.0f;
-            for (int j = 0; j < cluster_size; ++j) {
-                if (vector_ids[cluster_start + j] == true_id) {
-                    true_pq_dist = pq_dists_host[j];
-                    break;
-                }
-            }
-            
-            if (true_pq_dist < 0) continue;
-            
-            // 排序该聚类内的 PQ 距离，获取第 LIMIT_K 名的距离
+            // 排序并获取第 LIMIT_K 名的距离作为该聚类的 cutoff
             std::vector<float> sorted_pq_dists = pq_dists_host;
             std::sort(sorted_pq_dists.begin(), sorted_pq_dists.end());
             
             int limit_k_idx = std::min(results.recommended_limit_k - 1, cluster_size - 1);
             if (limit_k_idx < 0) limit_k_idx = 0;
-            float limit_k_pq_dist = sorted_pq_dists[limit_k_idx];
+            float cutoff = sorted_pq_dists[limit_k_idx];
             
-            // 计算比值: k近邻的 PQ 距离 / 该聚类第 LIMIT_K 名的 PQ 距离
-            if (limit_k_pq_dist > 0) {
-                float ratio = true_pq_dist / limit_k_pq_dist;
-                all_ratios.push_back(ratio);
+            p1_cutoffs.push_back(cutoff);
+        }
+        
+        if (p1_cutoffs.empty()) continue;
+        
+        // ===== 步骤2: 取最小的 cutoff 作为基准（与搜索逻辑一致）=====
+        float min_cutoff = *std::min_element(p1_cutoffs.begin(), p1_cutoffs.end());
+        
+        // ===== 步骤3: 计算最远 k 近邻的 PQ 距离 =====
+        int farthest_knn_id = gt_ids[i * config.final_k + config.final_k - 1];
+        
+        // 找到最远 k 近邻所在的聚类
+        int farthest_cluster = -1;
+        for (int c = 0; c < n_clusters; ++c) {
+            int start = cluster_offsets[c];
+            int end = cluster_offsets[c + 1];
+            for (int j = start; j < end; ++j) {
+                if (vector_ids[j] == farthest_knn_id) {
+                    farthest_cluster = c;
+                    break;
+                }
             }
+            if (farthest_cluster != -1) break;
+        }
+        
+        if (farthest_cluster == -1) continue;
+        
+        // 计算最远 k 近邻的 PQ 距离
+        int cluster_start = cluster_offsets[farthest_cluster];
+        int cluster_end = cluster_offsets[farthest_cluster + 1];
+        int cluster_size = cluster_end - cluster_start;
+        
+        float *d_query_single, *d_pq_dists, *d_centroid_single;
+        uint8_t *d_cluster_codes;
+        
+        cudaMalloc(&d_query_single, DIM * sizeof(float));
+        cudaMalloc(&d_centroid_single, DIM * sizeof(float));
+        cudaMalloc(&d_pq_dists, cluster_size * sizeof(float));
+        cudaMalloc(&d_cluster_codes, cluster_size * PQ_M * sizeof(uint8_t));
+        
+        cudaMemcpy(d_query_single, query, DIM * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_centroid_single, centroids + farthest_cluster * DIM, DIM * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_cluster_codes, pq_codes + cluster_start * PQ_M, 
+                   cluster_size * PQ_M * sizeof(uint8_t), cudaMemcpyHostToDevice);
+        
+        precompute_lut_kernel<<<PQ_M, PQ_K>>>(
+            d_query_single, d_centroid_single, d_pq_codebook, d_lut
+        );
+        
+        int threads_pq = 256;
+        int blocks_pq = (cluster_size + threads_pq - 1) / threads_pq;
+        compute_pq_dist_with_lut_kernel<<<blocks_pq, threads_pq>>>(
+            d_cluster_codes, d_lut, d_pq_dists, cluster_size
+        );
+        cudaDeviceSynchronize();
+        
+        std::vector<float> pq_dists_host(cluster_size);
+        cudaMemcpy(pq_dists_host.data(), d_pq_dists, 
+                   cluster_size * sizeof(float), cudaMemcpyDeviceToHost);
+        
+        cudaFree(d_query_single);
+        cudaFree(d_centroid_single);
+        cudaFree(d_pq_dists);
+        cudaFree(d_cluster_codes);
+        
+        // 找到最远 k 近邻的 PQ 距离
+        float farthest_knn_pq_dist = -1.0f;
+        for (int j = 0; j < cluster_size; ++j) {
+            if (vector_ids[cluster_start + j] == farthest_knn_id) {
+                farthest_knn_pq_dist = pq_dists_host[j];
+                break;
+            }
+        }
+        
+        if (farthest_knn_pq_dist < 0) continue;
+        
+        // ===== 步骤4: 计算比值 =====
+        if (min_cutoff > 0) {
+            float ratio = farthest_knn_pq_dist / min_cutoff;
+            all_ratios.push_back(ratio);
         }
     }
     
@@ -761,18 +980,17 @@ TuneResults tune_search_parameters(
     
     // 计算 THRESHOLD_COEFF (取最大值，确保 100% 覆盖)
     if (!all_ratios.empty()) {
-        // 使用 P99 或最大值
         float max_ratio = *std::max_element(all_ratios.begin(), all_ratios.end());
         float p99_ratio = compute_percentile(all_ratios, config.p99_percentile);
-        results.threshold_coeff = std::max(max_ratio, p99_ratio);  // 取最大值确保覆盖
+        results.threshold_coeff = max_ratio;  // 使用最大值确保 100% 覆盖
     } else {
         results.threshold_coeff = 2.0f;  // 默认值
     }
     
     std::cout << "阈值系数分析完成" << std::endl;
-    std::cout << "  - 有效样本数 (P1_LISTS 内的 k 近邻): " << all_ratios.size() << std::endl;
+    std::cout << "  - 有效样本数: " << all_ratios.size() << std::endl;
     if (!all_ratios.empty()) {
-        std::cout << "  - 平均比值 (kNN_PQ / LIMIT_K_PQ): " 
+        std::cout << "  - 平均比值 (最远kNN_PQ / min_cutoff): " 
                   << std::accumulate(all_ratios.begin(), all_ratios.end(), 0.0f) / all_ratios.size() << std::endl;
         std::cout << "  - 最大比值: " << *std::max_element(all_ratios.begin(), all_ratios.end()) << std::endl;
         std::cout << "  - P99 比值: " << compute_percentile(all_ratios, config.p99_percentile) << std::endl;

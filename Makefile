@@ -48,15 +48,19 @@ LDLIBS   := -lcudart -lraft
 # ------------------------------------------------------------------------------
 # 4. 构建目标
 # ------------------------------------------------------------------------------
-HEADERS  := defs.h utils.h pq_utils.h cagra_adapter.cuh
+HEADERS  := defs.h utils.h pq_utils.h cagra_adapter.cuh kmeans_gpu.cuh
 
 .PHONY: all clean
 
-all: tune_parameters
+all: build_global tune_parameters
+
+# 索引构建工具
+build_global: build_global.cu $(HEADERS)
+	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 # 参数调优工具
 tune_parameters: tune_parameters.cu $(HEADERS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS)
 
 clean:
-	rm -f tune_parameters *.o
+	rm -f build_global tune_parameters *.o

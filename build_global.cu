@@ -43,29 +43,18 @@ int main(int argc, char** argv) {
     // *注意*：此时不要构建 CAGRA 索引，因为中心点即将发生剧烈变化
 
     // ---------------------------------------------------------
-    // 3. 初始分配 (Initial Assignment)
+    // 3. 初始分配 (Initial Assignment) - GPU 加速版
     // ---------------------------------------------------------
-    std::cout << "Assigning vectors to initial clusters..." << std::endl;
-    std::vector<std::vector<int>> initial_buckets(K_CLUSTERS);
+    std::cout << "Assigning vectors to initial clusters (GPU)..." << std::endl;
+    std::vector<std::vector<int>> initial_buckets;
     
-    #pragma omp parallel for
-    for(int i=0; i<n; ++i) {
-        float min_d = std::numeric_limits<float>::max();
-        int best_c = 0;
-        
-        // 暴力搜索最近中心点 (此时 K 很小，CPU 尚可接受，或者也可以用 GPU search)
-        for(int c=0; c<K_CLUSTERS; ++c) {
-            float d = 0; 
-            for(int j=0; j<DIM; ++j) {
-                float diff = points[i].coordinates[j] - initial_centroids[c*DIM+j];
-                d += diff*diff;
-            }
-            if(d < min_d) { min_d = d; best_c = c; }
-        }
-        
-        #pragma omp critical
-        initial_buckets[best_c].push_back(i);
-    }
+    // 使用 GPU 进行初始分配
+    gpu_assign_initial_clusters(
+        data_ptr,                    // 原始数据 [n, DIM]
+        initial_centroids.data(),    // 质心 [K_CLUSTERS, DIM]
+        n, DIM, K_CLUSTERS,
+        initial_buckets              // 输出：每个聚类的向量索引
+    );
 
     // ---------------------------------------------------------
     // 4. 递归重平衡 (Recursive Rebalancing)
@@ -132,32 +121,24 @@ int main(int argc, char** argv) {
             std::copy(src, src + DIM, subset_data.begin() + i*DIM);
         }
 
-        // 运行局部 K-Means
+        // 运行局部 K-Means (GPU 加速)
         std::vector<float> sub_centroids_flat;
-        // iter=15 保证局部快速收敛
         run_kmeans_gpu(subset_data.data(), curr_size, DIM, sub_k, sub_centroids_flat, 15);
 
-        // 分配到新的 sub_k 个子桶
+        // GPU 加速分配到新的 sub_k 个子桶
+        std::vector<int> local_assignments;
+        gpu_assign_to_centroids(
+            subset_data.data(),           // 子集数据
+            sub_centroids_flat.data(),    // 子质心
+            curr_size, DIM, sub_k,
+            local_assignments             // 输出分配结果
+        );
+        
+        // 根据分配结果构建 child_buckets
         std::vector<std::vector<int>> child_buckets(sub_k);
         for(size_t i=0; i < curr_size; ++i) {
             int original_vec_idx = task.indices[i];
-            const float* vec = points[original_vec_idx].coordinates;
-            
-            float min_local_d = std::numeric_limits<float>::max();
-            int best_sub_c = 0;
-
-            for(int k=0; k<sub_k; ++k) {
-                float d = 0;
-                for(int d_idx=0; d_idx<DIM; ++d_idx) {
-                    float diff = vec[d_idx] - sub_centroids_flat[k*DIM + d_idx];
-                    d += diff * diff;
-                }
-                if(d < min_local_d) {
-                    min_local_d = d;
-                    best_sub_c = k;
-                }
-            }
-            child_buckets[best_sub_c].push_back(original_vec_idx);
+            child_buckets[local_assignments[i]].push_back(original_vec_idx);
         }
 
         // [关键] 将所有非空子桶重新放入队列进行检查
@@ -225,11 +206,18 @@ int main(int argc, char** argv) {
     out_pq.close();
 
     // ---------------------------------------------------------
-    // 8. 编码残差 (Encoding)
+    // 8. 编码残差 (Encoding) - GPU 加速版
     // ---------------------------------------------------------
-    std::cout << "Encoding residuals..." << std::endl;
+    std::cout << "Encoding residuals (GPU)..." << std::endl;
     std::vector<uint8_t> temp_codes((size_t)n * PQ_M);
-    encode_residuals_to_pq(points, n, vec_cluster_ids, final_centroids, global_codebook, temp_codes.data());
+    encode_residuals_to_pq_gpu(
+        data_ptr, n, DIM,
+        vec_cluster_ids, 
+        final_centroids, 
+        global_codebook, 
+        temp_codes.data(),
+        PQ_M, PQ_K, PQ_SUB_DIM
+    );
 
     // ---------------------------------------------------------
     // 9. 构建与保存倒排列表 (Building & Saving IVF)

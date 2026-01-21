@@ -324,7 +324,7 @@ __global__ void ivf_scan_phase1_kernel(
     }
 }
 
-// 计算阈值: 取 P1_LISTS 中最小的 cutoff (原始逻辑)
+// 计算阈值: 取 P1_LISTS 中最小的 cutoff * threshold_coeff
 __global__ void compute_threshold_kernel(const float* d_list_cutoffs, float* d_thresholds, int p1_lists, float threshold_coeff) {
     int q_idx = blockIdx.x;
     if (threadIdx.x != 0) return;
@@ -516,12 +516,15 @@ void run_gpu_batch_logic(
     size_t& current_pool_cap, int* d_counts, int* d_offsets, int* d_atomic,
     int* d_top_ids, float* d_top_dists, int* d_top_counts,
     int batch_size, int top_m, int rerank_m, int final_k, 
-    float prune_ratio,       
+    float prune_ratio,
     float* d_list_cutoffs, 
     float* d_thresholds, 
     int* d_compact_offsets,
     cudaStream_t stream_main,
-    BatchLogicEvents* events
+    BatchLogicEvents* events,
+    int p1_lists = DEFAULT_P1_LISTS,              // Phase 1 密集搜索的聚类数量
+    int limit_k = DEFAULT_LIMIT_K,                // 每个聚类内保留的候选数量
+    float threshold_coeff = DEFAULT_THRESHOLD_COEFF  // Phase 2 阈值放宽系数
 ) {
     if (events) cudaEventRecord(events->evt_start, stream_main);
 
@@ -584,19 +587,19 @@ void run_gpu_batch_logic(
     cudaMemsetAsync(d_flat_dists, 0x7F, needed * sizeof(float), stream_main);
     cudaMemsetAsync(d_atomic, 0, batch_size * sizeof(int), stream_main);
     
-    int scan_phase1_limit_k = std::max(1, 2 * final_k); 
-    int p1_lists = (top_m < 8) ? top_m : 8;
+    // 使用传入的参数，确保不超过 top_m
+    int actual_p1_lists = (top_m < p1_lists) ? top_m : p1_lists;
     
-    ivf_scan_phase1_kernel<<<dim3(batch_size, p1_lists), 256, 0, stream_main>>>(
+    ivf_scan_phase1_kernel<<<dim3(batch_size, actual_p1_lists), 256, 0, stream_main>>>(
         idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
         d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
-        top_m, p1_lists, scan_phase1_limit_k, d_list_cutoffs
+        top_m, actual_p1_lists, limit_k, d_list_cutoffs
     );
-    compute_threshold_kernel<<<batch_size, 1, 0, stream_main>>>(d_list_cutoffs, d_thresholds, p1_lists, 1.0f);
+    compute_threshold_kernel<<<batch_size, 1, 0, stream_main>>>(d_list_cutoffs, d_thresholds, actual_p1_lists, threshold_coeff);
     if (events) cudaEventRecord(events->evt_scan_phase1_end, stream_main);
 
-    if (top_m > 8) {
-        ivf_scan_phase2_kernel<<<dim3(batch_size, top_m - 8), 128, 0, stream_main>>>(
+    if (top_m > actual_p1_lists) {
+        ivf_scan_phase2_kernel<<<dim3(batch_size, top_m - actual_p1_lists), 128, 0, stream_main>>>(
             idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
             d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
             top_m, d_thresholds
