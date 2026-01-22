@@ -79,10 +79,12 @@ __global__ void prune_and_count_fused_kernel(
 __global__ void batch_residual_precompute_kernel(
     const float* __restrict__ queries, const float* __restrict__ centroids,    
     const uint32_t* __restrict__ top_m_ids, const float* __restrict__ codebook,     
-    float* __restrict__ out_tables, int top_m
+    float* __restrict__ out_tables, int top_m, int p1_lists
 ) {
     int q_idx = blockIdx.x;
     int m_idx = blockIdx.y; 
+    // 只计算 Phase 1 需要的 p1_lists 个聚类
+    if (m_idx >= p1_lists) return;
     uint32_t raw_id = top_m_ids[q_idx * top_m + m_idx];
     if (raw_id == 0xFFFFFFFF) return; 
 
@@ -253,6 +255,69 @@ __device__ __forceinline__ float compute_pq_dist_vectorized(
 #undef PROCESS_UCHAR4
 #undef PROCESS_UINT4
 
+// 直接计算完整 PQ 距离（不依赖预计算表）- 用于 Phase 2 按需计算
+__device__ __forceinline__ float compute_pq_dist_direct(
+    const uint8_t* __restrict__ pq_codes_ptr,
+    const float* __restrict__ query_residual,  // query - centroid
+    const float* __restrict__ codebook
+) {
+    float dist = 0.0f;
+    
+    // 对每个 PQ_M 子空间计算距离
+    #pragma unroll
+    for (int sub = 0; sub < PQ_M; ++sub) {
+        int code = pq_codes_ptr[sub];
+        int dim_offset = sub * PQ_SUB_DIM;
+        const float* c_sub = codebook + (sub * PQ_K + code) * PQ_SUB_DIM;
+        
+        // 计算子空间距离
+        #if PQ_SUB_DIM == 4
+            float4 residual_vec = *reinterpret_cast<const float4*>(&query_residual[dim_offset]);
+            float4 codebook_vec = *reinterpret_cast<const float4*>(c_sub);
+            
+            float4 diff_vec;
+            diff_vec.x = residual_vec.x - codebook_vec.x;
+            diff_vec.y = residual_vec.y - codebook_vec.y;
+            diff_vec.z = residual_vec.z - codebook_vec.z;
+            diff_vec.w = residual_vec.w - codebook_vec.w;
+            
+            float sub_dist = fmaf(diff_vec.x, diff_vec.x, 
+                           fmaf(diff_vec.y, diff_vec.y,
+                           fmaf(diff_vec.z, diff_vec.z, diff_vec.w * diff_vec.w)));
+        #elif PQ_SUB_DIM == 8
+            float4 residual_vec1 = *reinterpret_cast<const float4*>(&query_residual[dim_offset]);
+            float4 residual_vec2 = *reinterpret_cast<const float4*>(&query_residual[dim_offset + 4]);
+            float4 codebook_vec1 = *reinterpret_cast<const float4*>(c_sub);
+            float4 codebook_vec2 = *reinterpret_cast<const float4*>(c_sub + 4);
+            
+            float4 diff1, diff2;
+            diff1.x = residual_vec1.x - codebook_vec1.x;
+            diff1.y = residual_vec1.y - codebook_vec1.y;
+            diff1.z = residual_vec1.z - codebook_vec1.z;
+            diff1.w = residual_vec1.w - codebook_vec1.w;
+            
+            diff2.x = residual_vec2.x - codebook_vec2.x;
+            diff2.y = residual_vec2.y - codebook_vec2.y;
+            diff2.z = residual_vec2.z - codebook_vec2.z;
+            diff2.w = residual_vec2.w - codebook_vec2.w;
+            
+            float sub_dist = fmaf(diff1.x, diff1.x, fmaf(diff1.y, diff1.y, fmaf(diff1.z, diff1.z, diff1.w * diff1.w)));
+            sub_dist = fmaf(diff2.x, diff2.x, fmaf(diff2.y, diff2.y, fmaf(diff2.z, diff2.z, fmaf(diff2.w, diff2.w, sub_dist))));
+        #else
+            float sub_dist = 0.0f;
+            #pragma unroll
+            for (int d = 0; d < PQ_SUB_DIM; ++d) {
+                float diff = query_residual[dim_offset + d] - c_sub[d];
+                sub_dist = fmaf(diff, diff, sub_dist);
+            }
+        #endif
+        
+        dist += sub_dist;
+    }
+    
+    return dist;
+}
+
 __global__ void ivf_scan_phase1_kernel(
     const int* cluster_offsets, const uint32_t* top_m_ids, 
     const uint8_t* all_pq_codes, const int* all_vec_ids,
@@ -275,7 +340,7 @@ __global__ void ivf_scan_phase1_kernel(
     int len = cluster_offsets[c_id + 1] - start;
     if (len == 0) return;
 
-    const int ITEMS_PER_THREAD = 16;
+    const int ITEMS_PER_THREAD = 8;  
     const int BLOCK_THREADS = 128;  // 测试 128 线程块配置 
     int write_count = (len < limit_k) ? len : limit_k;
     if (len > BLOCK_THREADS * ITEMS_PER_THREAD) len = BLOCK_THREADS * ITEMS_PER_THREAD; 
@@ -363,14 +428,14 @@ __global__ void compute_threshold_kernel(const float* d_list_cutoffs, float* d_t
 __global__ void ivf_scan_phase2_kernel(
     const int* cluster_offsets, const uint32_t* top_m_ids, 
     const uint8_t* all_pq_codes, const int* all_vec_ids,
-    const float* global_tables, 
+    const float* queries, const float* centroids, const float* codebook,
     const int* query_base_offsets, int* query_atomic_counters,
     int* out_ids, float* out_dists, 
-    int top_m, const float* d_thresholds
+    int top_m, int p1_lists, const float* d_thresholds
 ) 
 {
     int q_idx = blockIdx.x; 
-    int m_idx = 8 + blockIdx.y; 
+    int m_idx = p1_lists + blockIdx.y; 
     if (m_idx >= top_m) return;
     float threshold = d_thresholds[q_idx];
     
@@ -382,7 +447,15 @@ __global__ void ivf_scan_phase2_kernel(
     int len = cluster_offsets[c_id + 1] - start;
     if (len == 0) return;
 
-    const float* my_table = global_tables + (size_t)q_idx * (top_m * PQ_M * PQ_K) + (size_t)m_idx * (PQ_M * PQ_K);
+    // 按需计算：在 shared memory 中计算 query 残差
+    __shared__ float s_residual[DIM];
+    int tid = threadIdx.x;
+    
+    // 协作计算残差 (query - centroid)
+    for (int i = tid; i < DIM; i += blockDim.x) {
+        s_residual[i] = queries[q_idx * DIM + i] - centroids[c_id * DIM + i];
+    }
+    __syncthreads();
     
     // 优化：使用 shared memory 分块收集，减少 atomicAdd 竞争
     const int BLOCK_SIZE = 128;  // 测试 128 线程块配置
@@ -396,12 +469,14 @@ __global__ void ivf_scan_phase2_kernel(
     }
     __syncthreads();
     
-    // 第一阶段：收集符合条件的候选到 shared memory
+    // 第一阶段：收集符合条件的候选到 shared memory（按需计算距离）
     for (int i = threadIdx.x; i < len; i += blockDim.x) {
         int ivf_idx = start + i; 
-        float dist = compute_pq_dist_vectorized(
+        // 使用直接计算，不依赖预计算表
+        float dist = compute_pq_dist_direct(
             all_pq_codes + (size_t)ivf_idx * PQ_M,
-            my_table
+            s_residual,
+            codebook
         );
         
         if (dist <= threshold) {
@@ -435,9 +510,10 @@ __global__ void ivf_scan_phase2_kernel(
         int processed = 0;
         for (int i = threadIdx.x; i < len && processed < s_count - BLOCK_SIZE; i += blockDim.x) {
             int ivf_idx = start + i; 
-            float dist = compute_pq_dist_vectorized(
+            float dist = compute_pq_dist_direct(
                 all_pq_codes + (size_t)ivf_idx * PQ_M,
-                my_table
+                s_residual,
+                codebook
             );
             if (dist <= threshold) {
                 int pos = atomicAdd(&query_atomic_counters[q_idx], 1);
@@ -646,9 +722,10 @@ void run_gpu_batch_logic(
     // 在GPU上直接计算total并写入d_offsets[batch_size]（完全在GPU上，无需中间缓冲区）
     compute_total_items_direct_kernel<<<1, 1, 0, stream_main>>>(d_counts, d_offsets, d_offsets + batch_size, batch_size);
     
-    // 1. Precompute (与D2H传输并行执行，最大化GPU利用率)
-    batch_residual_precompute_kernel<<<dim3(batch_size, top_m), 128, 0, stream_main>>>(
-        d_queries, idx.d_centroids, d_cagra_top_m, idx.d_pq_codebook, d_global_tables, top_m);
+    // 1. Precompute (只计算 Phase 1 需要的 p1_lists 个聚类，与D2H传输并行执行)
+    int actual_p1_lists = (top_m < p1_lists) ? top_m : p1_lists;
+    batch_residual_precompute_kernel<<<dim3(batch_size, actual_p1_lists), 128, 0, stream_main>>>(
+        d_queries, idx.d_centroids, d_cagra_top_m, idx.d_pq_codebook, d_global_tables, top_m, actual_p1_lists);
     if (events) cudaEventRecord(events->evt_precompute, stream_main);
     
     // 优化：异步D2H传输，延迟同步（让Precompute先执行）
@@ -692,9 +769,6 @@ void run_gpu_batch_logic(
     cudaMemsetAsync(d_flat_dists, 0x7F, needed * sizeof(float), stream_main);
     cudaMemsetAsync(d_atomic, 0, batch_size * sizeof(int), stream_main);
     
-    // 使用传入的参数，确保不超过 top_m
-    int actual_p1_lists = (top_m < p1_lists) ? top_m : p1_lists;
-    
     ivf_scan_phase1_kernel<<<dim3(batch_size, actual_p1_lists), 128, 0, stream_main>>>(
         idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
         d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
@@ -705,11 +779,12 @@ void run_gpu_batch_logic(
     if (events) cudaEventRecord(events->evt_scan_phase1_end, stream_main);
 
     if (top_m > actual_p1_lists) {
-        // 优化：统一线程块大小为 128，提高占用率
+        // Phase 2: 按需计算，不依赖预计算表
         ivf_scan_phase2_kernel<<<dim3(batch_size, top_m - actual_p1_lists), 128, 0, stream_main>>>(
             idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
-            d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
-            top_m, d_thresholds
+            d_queries, idx.d_centroids, idx.d_pq_codebook,
+            d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
+            top_m, actual_p1_lists, d_thresholds
         );
     }
     if (events) cudaEventRecord(events->evt_scan_cand, stream_main);
