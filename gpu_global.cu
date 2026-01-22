@@ -276,7 +276,7 @@ __global__ void ivf_scan_phase1_kernel(
     if (len == 0) return;
 
     const int ITEMS_PER_THREAD = 16;
-    const int BLOCK_THREADS = 256; 
+    const int BLOCK_THREADS = 128;  // 测试 128 线程块配置 
     int write_count = (len < limit_k) ? len : limit_k;
     if (len > BLOCK_THREADS * ITEMS_PER_THREAD) len = BLOCK_THREADS * ITEMS_PER_THREAD; 
 
@@ -325,18 +325,39 @@ __global__ void ivf_scan_phase1_kernel(
 }
 
 // 计算阈值: 取 P1_LISTS 中最小的 cutoff * threshold_coeff
+// 优化：使用并行归约减少计算时间（虽然 p1_lists 很小，但可以提高占用率）
 __global__ void compute_threshold_kernel(const float* d_list_cutoffs, float* d_thresholds, int p1_lists, float threshold_coeff) {
     int q_idx = blockIdx.x;
-    if (threadIdx.x != 0) return;
     
-    float min_dist = FLT_MAX;
-    for (int i = 0; i < p1_lists; ++i) {
+    // 使用 shared memory 进行并行归约
+    __shared__ float s_min[128];
+    int tid = threadIdx.x;
+    
+    // 每个线程处理部分数据
+    float local_min = FLT_MAX;
+    for (int i = tid; i < p1_lists; i += blockDim.x) {
         float val = d_list_cutoffs[q_idx * p1_lists + i];
-        if (val < min_dist) {
-            min_dist = val;
+        if (val > 0.0f && val < local_min) {  // 排除未初始化的 0.0f
+            local_min = val;
         }
     }
-    d_thresholds[q_idx] = min_dist * threshold_coeff;
+    s_min[tid] = local_min;
+    __syncthreads();
+    
+    // 归约找到最小值
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_min[tid + stride] < s_min[tid] && s_min[tid + stride] > 0.0f) {
+                s_min[tid] = s_min[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    
+    // 第一个线程写入结果
+    if (tid == 0) {
+        d_thresholds[q_idx] = (s_min[0] < FLT_MAX) ? s_min[0] * threshold_coeff : FLT_MAX;
+    }
 }
 
 __global__ void ivf_scan_phase2_kernel(
@@ -362,19 +383,69 @@ __global__ void ivf_scan_phase2_kernel(
     if (len == 0) return;
 
     const float* my_table = global_tables + (size_t)q_idx * (top_m * PQ_M * PQ_K) + (size_t)m_idx * (PQ_M * PQ_K);
+    
+    // 优化：使用 shared memory 分块收集，减少 atomicAdd 竞争
+    const int BLOCK_SIZE = 128;  // 测试 128 线程块配置
+    __shared__ int s_ids[BLOCK_SIZE];
+    __shared__ float s_dists[BLOCK_SIZE];
+    __shared__ int s_count;
+    __shared__ int s_base_offset;
+    
+    if (threadIdx.x == 0) {
+        s_count = 0;
+    }
+    __syncthreads();
+    
+    // 第一阶段：收集符合条件的候选到 shared memory
     for (int i = threadIdx.x; i < len; i += blockDim.x) {
         int ivf_idx = start + i; 
-        // 使用向量化加载计算 PQ 距离
         float dist = compute_pq_dist_vectorized(
             all_pq_codes + (size_t)ivf_idx * PQ_M,
             my_table
         );
         
         if (dist <= threshold) {
-            int global_pos = atomicAdd(&query_atomic_counters[q_idx], 1);
-            int global_base = query_base_offsets[q_idx];
-            out_ids[global_base + global_pos] = all_vec_ids[ivf_idx];
-            out_dists[global_base + global_pos] = dist;
+            int local_pos = atomicAdd(&s_count, 1);
+            if (local_pos < BLOCK_SIZE) {
+                s_ids[local_pos] = all_vec_ids[ivf_idx];
+                s_dists[local_pos] = dist;
+            }
+        }
+    }
+    __syncthreads();
+    
+    // 第二阶段：批量写入全局内存（减少 atomic 调用）
+    int block_count = min(s_count, BLOCK_SIZE);
+    if (threadIdx.x == 0 && block_count > 0) {
+        s_base_offset = atomicAdd(&query_atomic_counters[q_idx], block_count);
+    }
+    __syncthreads();
+    
+    if (block_count > 0) {
+        int global_base = query_base_offsets[q_idx] + s_base_offset;
+        for (int i = threadIdx.x; i < block_count; i += blockDim.x) {
+            out_ids[global_base + i] = s_ids[i];
+            out_dists[global_base + i] = s_dists[i];
+        }
+    }
+    
+    // 处理超出 BLOCK_SIZE 的候选（回退到逐线程 atomic，但这种情况很少）
+    if (s_count > BLOCK_SIZE) {
+        // 重新扫描并写入超出部分
+        int processed = 0;
+        for (int i = threadIdx.x; i < len && processed < s_count - BLOCK_SIZE; i += blockDim.x) {
+            int ivf_idx = start + i; 
+            float dist = compute_pq_dist_vectorized(
+                all_pq_codes + (size_t)ivf_idx * PQ_M,
+                my_table
+            );
+            if (dist <= threshold) {
+                int pos = atomicAdd(&query_atomic_counters[q_idx], 1);
+                int global_base = query_base_offsets[q_idx];
+                out_ids[global_base + pos] = all_vec_ids[ivf_idx];
+                out_dists[global_base + pos] = dist;
+                processed++;
+            }
         }
     }
 }
@@ -429,6 +500,28 @@ __global__ void gather_top_m_kernel(
 }
 
 // ==========================================
+// 2.5. Compute Total Items (GPU)
+// ==========================================
+__global__ void compute_total_items_kernel(const int* d_counts, const int* d_offsets, int* d_total, int batch_size) {
+    // 只需要一个线程计算
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int last_count = d_counts[batch_size - 1];
+        int last_offset = d_offsets[batch_size - 1];
+        d_total[0] = last_offset + last_count;
+    }
+}
+
+// 优化版本：直接写入目标位置，避免中间缓冲区
+__global__ void compute_total_items_direct_kernel(const int* d_counts, const int* d_offsets, int* d_output, int batch_size) {
+    // 只需要一个线程计算并直接写入目标位置
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int last_count = d_counts[batch_size - 1];
+        int last_offset = d_offsets[batch_size - 1];
+        d_output[0] = last_offset + last_count;
+    }
+}
+
+// ==========================================
 // 3. Rerank Logic
 // ==========================================
 __global__ void init_rerank_state_kernel(int* d_final_ids, float* d_final_dists, int* d_stable_cnt, bool* d_finished, int batch_size, int final_k) {
@@ -472,7 +565,7 @@ __global__ void heuristic_rerank_kernel(const int* cid, const int* ccnt, const f
     }
     __syncthreads();
 
-    typedef cub::BlockRadixSort<float, 256, 1, int> BlockSort;
+    typedef cub::BlockRadixSort<float, 128, 1, int> BlockSort;
     __shared__ typename BlockSort::TempStorage temp;
     float key[1] = {FLT_MAX}; int val[1] = {-1};
     if(threadIdx.x < cap) { key[0] = s_d[threadIdx.x]; val[0] = s_i[threadIdx.x]; }
@@ -496,11 +589,11 @@ __global__ void heuristic_rerank_kernel(const int* cid, const int* ccnt, const f
 }
 
 void run_gpu_rerank(float* dq, int* tid, int* tcnt, float* dv, int* fid, float* fd, int* st, bool* fin, int bs, int rm, int k, int tv, int mb, float eps, int b, cudaStream_t s) {
-    init_rerank_state_kernel<<<(bs+255)/256, 256, 0, s>>>(fid, fd, st, fin, bs, k);
+    init_rerank_state_kernel<<<(bs+127)/128, 128, 0, s>>>(fid, fd, st, fin, bs, k);
     int cap = k + mb; size_t smem = DIM*4 + 16 + cap*8;
     cudaFuncSetAttribute(heuristic_rerank_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 96*1024);
     for(int off=0; off<rm; off+=mb) 
-        heuristic_rerank_kernel<<<bs, 256, smem, s>>>(tid, tcnt, dq, dv, fid, fd, st, fin, DIM, rm, off, mb, k, tv, eps, b);
+        heuristic_rerank_kernel<<<bs, 128, smem, s>>>(tid, tcnt, dq, dv, fid, fd, st, fin, DIM, rm, off, mb, k, tv, eps, b);
 }
 
 // ==========================================
@@ -526,49 +619,61 @@ void run_gpu_batch_logic(
     int limit_k = DEFAULT_LIMIT_K,                // 每个聚类内保留的候选数量
     float threshold_coeff = DEFAULT_THRESHOLD_COEFF  // Phase 2 阈值放宽系数
 ) {
+    // 优化：重用临时缓冲区，减少 cudaMalloc/cudaFree 开销
+    static void* d_temp_buffer = nullptr;
+    static size_t temp_buffer_size = 0;
     if (events) cudaEventRecord(events->evt_start, stream_main);
 
     // 0+2. Prune + Count (Fused) - 融合内核减少kernel launch开销
     cudaMemsetAsync(d_counts, 0, batch_size * sizeof(int), stream_main);
-    prune_and_count_fused_kernel<<<batch_size, 256, 0, stream_main>>>(
+    prune_and_count_fused_kernel<<<batch_size, 128, 0, stream_main>>>(
         d_cagra_top_m, d_cagra_dists, idx.d_cluster_offsets, d_counts, top_m, prune_ratio);
     if (events) cudaEventRecord(events->evt_prune_count, stream_main);
 
     // 3. Scan Offsets (提前执行，为Resize Check准备数据)
-    void *d_temp_scan = NULL; size_t temp_scan_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(d_temp_scan, temp_scan_bytes, d_counts, d_offsets, batch_size, stream_main);
-    cudaMalloc(&d_temp_scan, temp_scan_bytes);
-    cub::DeviceScan::ExclusiveSum(d_temp_scan, temp_scan_bytes, d_counts, d_offsets, batch_size, stream_main);
-    cudaFree(d_temp_scan);
+    // 优化：重用临时缓冲区
+    size_t temp_scan_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, temp_scan_bytes, d_counts, d_offsets, batch_size, stream_main);
+    if (temp_scan_bytes > temp_buffer_size) {
+        if (d_temp_buffer) cudaFree(d_temp_buffer);
+        cudaMalloc(&d_temp_buffer, temp_scan_bytes);
+        temp_buffer_size = temp_scan_bytes;
+    }
+    cub::DeviceScan::ExclusiveSum(d_temp_buffer, temp_scan_bytes, d_counts, d_offsets, batch_size, stream_main);
     if (events) cudaEventRecord(events->evt_scan_offset, stream_main);
 
-    // 4. Resize Check (异步启动，与Precompute并行)
-    // 使用pinned memory实现零拷贝
-    static int* h_total_pinned = nullptr;
-    if (!h_total_pinned) {
-        cudaMallocHost(&h_total_pinned, 2 * sizeof(int));  // [last_count, last_offset]
-    }
+    // 4. Resize Check (完全在GPU上计算total，延迟同步到CPU)
+    // 在GPU上直接计算total并写入d_offsets[batch_size]（完全在GPU上，无需中间缓冲区）
+    compute_total_items_direct_kernel<<<1, 1, 0, stream_main>>>(d_counts, d_offsets, d_offsets + batch_size, batch_size);
     
-    // 异步拷贝到CPU（不阻塞）
-    cudaMemcpyAsync(&h_total_pinned[0], d_counts + batch_size - 1, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
-    cudaMemcpyAsync(&h_total_pinned[1], d_offsets + batch_size - 1, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
-    
-    // 1. Precompute (与CPU的Resize Check并行执行)
-    batch_residual_precompute_kernel<<<dim3(batch_size, top_m), 256, 0, stream_main>>>(
+    // 1. Precompute (与D2H传输并行执行，最大化GPU利用率)
+    batch_residual_precompute_kernel<<<dim3(batch_size, top_m), 128, 0, stream_main>>>(
         d_queries, idx.d_centroids, d_cagra_top_m, idx.d_pq_codebook, d_global_tables, top_m);
     if (events) cudaEventRecord(events->evt_precompute, stream_main);
     
-    // 现在CPU可以在Precompute执行期间处理Resize Check
-    // 同步等待D2H完成（此时Precompute正在GPU上执行）
-    cudaStreamSynchronize(stream_main);
+    // 优化：异步D2H传输，延迟同步（让Precompute先执行）
+    // 使用pinned memory实现零拷贝
+    static int* h_total_pinned = nullptr;
+    if (!h_total_pinned) {
+        cudaMallocHost(&h_total_pinned, sizeof(int));
+    }
     
-    // CPU计算total（简单加法，几乎零开销）
-    int total_items = h_total_pinned[1] + h_total_pinned[0];  // offset + count
+    // 异步拷贝total到CPU（不阻塞，与Precompute并行）
+    cudaMemcpyAsync(h_total_pinned, d_offsets + batch_size, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
     
-    // 写回GPU（用于CUB Sort）
-    cudaMemcpyAsync(d_offsets + batch_size, &total_items, sizeof(int), cudaMemcpyHostToDevice, stream_main);
+    // 优化：使用事件同步，延迟到真正需要时才等待
+    // 这样可以让Precompute充分利用GPU，减少CPU等待时间
+    cudaEvent_t d2h_done;
+    cudaEventCreate(&d2h_done);
+    cudaEventRecord(d2h_done, stream_main);
     
-    // 检查是否需要resize
+    // 延迟同步：只在需要resize检查时才等待（resize检查必须在CPU端进行）
+    // 注意：resize检查需要total_items值，所以必须同步，但可以延迟到Precompute之后
+    cudaEventSynchronize(d2h_done);  // 等待D2H完成（此时Precompute可能已经完成或接近完成）
+    cudaEventDestroy(d2h_done);
+    
+    // CPU获取total（用于resize检查）
+    int total_items = h_total_pinned[0];
     size_t needed = total_items;
     if (needed > current_pool_cap) {
         current_pool_cap = needed * 1.5;
@@ -590,15 +695,17 @@ void run_gpu_batch_logic(
     // 使用传入的参数，确保不超过 top_m
     int actual_p1_lists = (top_m < p1_lists) ? top_m : p1_lists;
     
-    ivf_scan_phase1_kernel<<<dim3(batch_size, actual_p1_lists), 256, 0, stream_main>>>(
+    ivf_scan_phase1_kernel<<<dim3(batch_size, actual_p1_lists), 128, 0, stream_main>>>(
         idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
         d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
         top_m, actual_p1_lists, limit_k, d_list_cutoffs
     );
-    compute_threshold_kernel<<<batch_size, 1, 0, stream_main>>>(d_list_cutoffs, d_thresholds, actual_p1_lists, threshold_coeff);
+   
+    compute_threshold_kernel<<<batch_size, 128, 0, stream_main>>>(d_list_cutoffs, d_thresholds, actual_p1_lists, threshold_coeff);
     if (events) cudaEventRecord(events->evt_scan_phase1_end, stream_main);
 
     if (top_m > actual_p1_lists) {
+        // 优化：统一线程块大小为 128，提高占用率
         ivf_scan_phase2_kernel<<<dim3(batch_size, top_m - actual_p1_lists), 128, 0, stream_main>>>(
             idx.d_cluster_offsets, d_cagra_top_m, idx.d_all_pq_codes, idx.d_all_vector_ids, 
             d_global_tables, d_offsets, d_atomic, d_flat_ids, d_flat_dists, 
@@ -612,25 +719,34 @@ void run_gpu_batch_logic(
     // =========================================================
     // A. 计算紧凑 Offsets (Scan d_atomic -> d_compact_offsets)
     // 注意：Scan 需要 `batch_size + 1` 大小的 offset 数组
-    d_temp_scan = NULL; temp_scan_bytes = 0;
-    cub::DeviceScan::ExclusiveSum(d_temp_scan, temp_scan_bytes, d_atomic, d_compact_offsets, batch_size, stream_main);
-    cudaMalloc(&d_temp_scan, temp_scan_bytes);
-    cub::DeviceScan::ExclusiveSum(d_temp_scan, temp_scan_bytes, d_atomic, d_compact_offsets, batch_size, stream_main);
-    cudaFree(d_temp_scan);
+    // 优化：重用临时缓冲区
+    temp_scan_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, temp_scan_bytes, d_atomic, d_compact_offsets, batch_size, stream_main);
+    if (temp_scan_bytes > temp_buffer_size) {
+        if (d_temp_buffer) cudaFree(d_temp_buffer);
+        cudaMalloc(&d_temp_buffer, temp_scan_bytes);
+        temp_buffer_size = temp_scan_bytes;
+    }
+    cub::DeviceScan::ExclusiveSum(d_temp_buffer, temp_scan_bytes, d_atomic, d_compact_offsets, batch_size, stream_main);
 
-    // B. 获取 Compact Total Size (Host-Device Sync needed for CUB Sort API)
-    // 性能权衡：这是一个极小的 D2H，延时约 10us，远小于排序优化带来的 ms 级提升
-    int compact_last_cnt, compact_last_off;
-    cudaMemcpyAsync(&compact_last_cnt, d_atomic + batch_size - 1, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
-    cudaMemcpyAsync(&compact_last_off, d_compact_offsets + batch_size - 1, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
-    cudaStreamSynchronize(stream_main);
-    int compact_total_items = compact_last_off + compact_last_cnt;
-    cudaMemcpyAsync(d_compact_offsets + batch_size, &compact_total_items, sizeof(int), cudaMemcpyHostToDevice, stream_main);
+    // B. 获取 Compact Total Size (完全在GPU上计算，延迟同步到CPU)
+    // 直接在GPU上计算并写入d_compact_offsets[batch_size]
+    compute_total_items_direct_kernel<<<1, 1, 0, stream_main>>>(d_atomic, d_compact_offsets, d_compact_offsets + batch_size, batch_size);
+    
+    // 优化：异步D2H传输，延迟同步（与Compaction并行执行）
+    // CUB Sort API调用在CPU端，需要compact_total_items值，但可以延迟获取
+    static int* h_compact_total_pinned = nullptr;
+    if (!h_compact_total_pinned) {
+        cudaMallocHost(&h_compact_total_pinned, sizeof(int));
+    }
+    
+    // 异步拷贝total到CPU（不阻塞，与Compaction并行）
+    cudaMemcpyAsync(h_compact_total_pinned, d_compact_offsets + batch_size, sizeof(int), cudaMemcpyDeviceToHost, stream_main);
 
     // C. 执行 Compaction 搬运
     // 从 d_flat_ids (Sparse) -> d_flat_ids_alt (Dense)
     // 读取使用 d_offsets, 写入使用 d_compact_offsets
-    compact_candidates_kernel<<<batch_size, 256, 0, stream_main>>>(
+    compact_candidates_kernel<<<batch_size, 128, 0, stream_main>>>(
         d_flat_ids, d_flat_dists,
         d_offsets, d_atomic,
         d_compact_offsets,
@@ -647,19 +763,33 @@ void run_gpu_batch_logic(
     cub::DoubleBuffer<float> d_keys(d_flat_dists_alt, d_flat_dists);
     cub::DoubleBuffer<int>   d_values(d_flat_ids_alt, d_flat_ids);
     
-    void *d_temp_sort = NULL; size_t temp_sort_bytes = 0;
-    cub::DeviceSegmentedRadixSort::SortPairs(d_temp_sort, temp_sort_bytes, d_keys, d_values,
+    // 延迟同步：在需要CUB Sort API调用时才等待D2H完成
+    // 这样可以让Compaction充分利用GPU，减少CPU等待时间
+    cudaEvent_t compact_d2h_done;
+    cudaEventCreate(&compact_d2h_done);
+    cudaEventRecord(compact_d2h_done, stream_main);
+    cudaEventSynchronize(compact_d2h_done);  // 等待D2H完成（此时Compaction可能已经完成）
+    cudaEventDestroy(compact_d2h_done);
+    
+    int compact_total_items = h_compact_total_pinned[0];
+    
+    // 优化：重用临时缓冲区（使用更大的缓冲区以容纳 sort 的需求）
+    size_t temp_sort_bytes = 0;
+    cub::DeviceSegmentedRadixSort::SortPairs(nullptr, temp_sort_bytes, d_keys, d_values,
         compact_total_items, batch_size, d_compact_offsets, d_compact_offsets + 1, 0, sizeof(float)*8, stream_main);
-    cudaMalloc(&d_temp_sort, temp_sort_bytes);
-    cub::DeviceSegmentedRadixSort::SortPairs(d_temp_sort, temp_sort_bytes, d_keys, d_values,
+    if (temp_sort_bytes > temp_buffer_size) {
+        if (d_temp_buffer) cudaFree(d_temp_buffer);
+        cudaMalloc(&d_temp_buffer, temp_sort_bytes);
+        temp_buffer_size = temp_sort_bytes;
+    }
+    cub::DeviceSegmentedRadixSort::SortPairs(d_temp_buffer, temp_sort_bytes, d_keys, d_values,
         compact_total_items, batch_size, d_compact_offsets, d_compact_offsets + 1, 0, sizeof(float)*8, stream_main);
-    cudaFree(d_temp_sort);
     
     if (events) cudaEventRecord(events->evt_sort, stream_main);
 
     // 8. Gather
     // 使用 d_atomic (Count) 和 d_compact_offsets
-    gather_top_m_kernel<<<batch_size, 256, 0, stream_main>>>(
+    gather_top_m_kernel<<<batch_size, 128, 0, stream_main>>>(
         d_values.Current(), d_keys.Current(), 
         d_compact_offsets, d_atomic, 
         d_top_ids, d_top_dists, d_top_counts, rerank_m

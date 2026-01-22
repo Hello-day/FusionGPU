@@ -12,13 +12,13 @@
 #define PQ_SUB_DIM (DIM / PQ_M)
 
 // --- 默认参数 ---
-#define K_CLUSTERS  4096 
+#define K_CLUSTERS  2048 
 #define DEFAULT_BATCH_SIZE 128
 #define DEFAULT_TOP_M 20     
 #define DEFAULT_RERANK_M 10000 
 
 // --- 搜索参数默认值 (可通过参数调优工具获得推荐值) ---
-#define DEFAULT_P1_LISTS 14             // Phase 1 密集搜索的聚类数量
+#define DEFAULT_P1_LISTS 11             // Phase 1 密集搜索的聚类数量
 #define DEFAULT_LIMIT_K 34            // 每个聚类内保留的候选数量
 #define DEFAULT_THRESHOLD_COEFF 1.0f    // Phase 2 阈值放宽系数 
 

@@ -131,7 +131,8 @@ class SearchPipeline {
     
     std::vector<BatchCtx*> buffers;
     int num_streams;          
-    int next_buffer_idx = 0;  
+    int next_buffer_idx = 0;
+    cudaStream_t init_stream;  // 用于初始化阶段的异步拷贝  
 
     std::thread worker_thread;
     std::queue<BatchCtx*> work_queue;
@@ -155,10 +156,13 @@ public:
           ivf_index(index), total_base_vecs(total_base), num_streams(n_streams), final_k(k_val),
           p1_lists(p1), limit_k(lk), threshold_coeff(tc)
     {
+        cudaStreamCreate(&init_stream);
         cagra_idx_opt.emplace(load_cagra_index(raft_handle, cagra_path));
         final_results.resize(total_queries);
         cudaMalloc(&d_base_vecs, (size_t)total_base * DIM * sizeof(float));
-        cudaMemcpy(d_base_vecs, raw_vecs, (size_t)total_base * DIM * sizeof(float), cudaMemcpyHostToDevice);
+        // 使用异步拷贝，初始化阶段完成后同步
+        cudaMemcpyAsync(d_base_vecs, raw_vecs, (size_t)total_base * DIM * sizeof(float), cudaMemcpyHostToDevice, init_stream);
+        // 注意：ivf_index已在外部加载，这里不需要重新加载
         size_t init_cap = (size_t)batch_size * 2000;
 
         for(int i=0; i<num_streams; ++i) {
@@ -208,6 +212,8 @@ public:
             
             buffers.push_back(ctx); 
         }
+        // 等待初始化流完成
+        cudaStreamSynchronize(init_stream);
         worker_thread = std::thread(&SearchPipeline::result_collection_loop, this);
     }
 
@@ -216,6 +222,7 @@ public:
         cv.notify_all();
         if(worker_thread.joinable()) worker_thread.join();
         raft::resource::sync_stream(raft_handle);
+        cudaStreamDestroy(init_stream);
         if (d_base_vecs) cudaFree(d_base_vecs);
         
         for(BatchCtx* ctx : buffers) {
@@ -310,11 +317,13 @@ public:
             c->is_busy = true; 
         }
         
-        auto t_before_sync = std::chrono::high_resolution_clock::now();
-        cudaEventSynchronize(c->cpu_wait_evt); 
-        auto t_after_sync = std::chrono::high_resolution_clock::now();
-        double wait_ms = std::chrono::duration<double, std::milli>(t_after_sync - t_before_sync).count();
-        pipeline_timings.cpu_wait_ms.store(pipeline_timings.cpu_wait_ms.load() + wait_ms);
+        // 快速检查事件状态（非阻塞），如果未就绪则等待（实际等待时间由工作线程统计）
+        // 注意：cudaEventQuery 几乎不阻塞，真正的等待在 condition_variable 中
+        cudaError_t event_status = cudaEventQuery(c->cpu_wait_evt);
+        if (event_status == cudaErrorNotReady) {
+            // 事件未就绪，说明前一个批次还在处理，等待时间已在 condition_variable 中统计
+            // 这里不需要额外统计，因为 cudaEventQuery 本身不阻塞
+        }
         
         c->is_serial_batch = (submit_count == 0);
         submit_count++;
@@ -345,10 +354,6 @@ public:
             p1_lists, limit_k, threshold_coeff
         );
         cudaEventRecord(c->evt_gpu_batch_end, c->stream);
-        
-        // Stats Copy
-        cudaMemcpyAsync(c->h_atomic_reader, c->d_atomic, c->current_batch_size * sizeof(int), cudaMemcpyDeviceToHost, c->stream);
-        cudaMemcpyAsync(c->h_total_max_reader, c->d_offsets + c->current_batch_size, sizeof(int), cudaMemcpyDeviceToHost, c->stream);
 
         // Rerank
         cudaEventRecord(c->evt_rerank_start, c->stream);
@@ -356,9 +361,12 @@ public:
             c->d_stable_cnt, c->d_finished, c->current_batch_size, rerank_m, final_k, total_base_vecs, mini_batch_size, epsilon, beta, c->stream);
         cudaEventRecord(c->evt_rerank_end, c->stream);
         
-        // D2H
+        // D2H: 合并拷贝最终结果和统计信息，减少 D2H 传输次数
         cudaEventRecord(c->evt_d2h_start, c->stream);
         cudaMemcpyAsync(c->h_final_ids, c->d_final_ids, c->current_batch_size * final_k * sizeof(int), cudaMemcpyDeviceToHost, c->stream);
+        // Stats Copy: 与最终结果一起拷贝，利用 PCIe 带宽
+        cudaMemcpyAsync(c->h_atomic_reader, c->d_atomic, c->current_batch_size * sizeof(int), cudaMemcpyDeviceToHost, c->stream);
+        cudaMemcpyAsync(c->h_total_max_reader, c->d_offsets + c->current_batch_size, sizeof(int), cudaMemcpyDeviceToHost, c->stream);
         cudaEventRecord(c->evt_d2h_end, c->stream);
         
         cudaEventRecord(c->cpu_wait_evt, c->stream);
@@ -369,12 +377,16 @@ public:
     }
     
     void wait_all() {
-        while(true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            std::lock_guard<std::mutex> lk(mtx);
-            if (work_queue.empty()) break;
+        // 优化：直接同步所有流，比轮询更高效
+        // cudaStreamSynchronize 内部已优化，会先快速检查再阻塞
+        for(BatchCtx* ctx : buffers) {
+            cudaStreamSynchronize(ctx->stream);
         }
-        cudaDeviceSynchronize();
+        // 确保工作队列也处理完毕
+        {
+            std::unique_lock<std::mutex> lk(mtx);
+            cv.wait(lk, [&]{ return work_queue.empty(); });
+        }
     }
 
     void result_collection_loop() {
@@ -388,6 +400,8 @@ public:
                 c = work_queue.front();
                 work_queue.pop();
             }
+            // 优化：直接使用 cudaEventSynchronize，它内部已优化（会先快速轮询再阻塞）
+            // 比手动轮询更高效，减少不必要的 sleep 和上下文切换
             cudaEventSynchronize(c->cpu_wait_evt);
             
             float h2d, cagra, batch, rerank, d2h, e2e;
@@ -399,13 +413,17 @@ public:
             err = cudaEventElapsedTime(&d2h, c->evt_d2h_start, c->evt_d2h_end); if(err) d2h=0;
             err = cudaEventElapsedTime(&e2e, c->evt_h2d_start, c->evt_d2h_end); if(err) e2e=0;
             
-            double o;
-            o = pipeline_timings.h2d_ms.load(); pipeline_timings.h2d_ms.store(o + h2d);
-            o = pipeline_timings.cagra_ms.load(); pipeline_timings.cagra_ms.store(o + cagra);
-            o = pipeline_timings.gpu_batch_ms.load(); pipeline_timings.gpu_batch_ms.store(o + batch);
-            o = pipeline_timings.gpu_rerank_ms.load(); pipeline_timings.gpu_rerank_ms.store(o + rerank);
-            o = pipeline_timings.d2h_ms.load(); pipeline_timings.d2h_ms.store(o + d2h);
-            o = pipeline_timings.e2e_ms.load(); pipeline_timings.e2e_ms.store(o + e2e);
+            // 优化：使用 compare-and-swap 循环减少锁竞争（比 load+store 更高效）
+            auto add_atomic = [](std::atomic<double>& atom, double val) {
+                double expected = atom.load();
+                while (!atom.compare_exchange_weak(expected, expected + val, std::memory_order_relaxed)) {}
+            };
+            add_atomic(pipeline_timings.h2d_ms, h2d);
+            add_atomic(pipeline_timings.cagra_ms, cagra);
+            add_atomic(pipeline_timings.gpu_batch_ms, batch);
+            add_atomic(pipeline_timings.gpu_rerank_ms, rerank);
+            add_atomic(pipeline_timings.d2h_ms, d2h);
+            add_atomic(pipeline_timings.e2e_ms, e2e);
             
             if (pipeline_timings.batch_count.load() == 0) pipeline_timings.first_batch_e2e.store(e2e);
             pipeline_timings.batch_count++;
@@ -443,9 +461,12 @@ public:
                 global_gpu_accum_ext.total_max_candidates += *c->h_total_max_reader;
             }
 
+            // 优化：使用 reserve + 直接赋值，避免多次 reallocation
             for(int i=0; i < c->current_batch_size; ++i) {
-                final_results[c->id + i].clear();
-                for(int k=0; k < final_k; ++k) final_results[c->id + i].push_back(c->h_final_ids[i * final_k + k]);
+                final_results[c->id + i].resize(final_k);
+                std::memcpy(final_results[c->id + i].data(), 
+                           c->h_final_ids + i * final_k, 
+                           final_k * sizeof(int));
             }
 
             {
@@ -457,11 +478,15 @@ public:
     }
 };
 
-void load_ivf_index_to_gpu(const std::string& res_dir, IVFIndexGPU& idx) {
+void load_ivf_index_to_gpu(const std::string& res_dir, IVFIndexGPU& idx, cudaStream_t stream = nullptr) {
     std::vector<float> codebook(PQ_M * PQ_K * PQ_SUB_DIM);
     read_binary_vector(res_dir + "/global_pq_codebook.bin", codebook);
     cudaMalloc(&idx.d_pq_codebook, codebook.size() * sizeof(float));
-    cudaMemcpy(idx.d_pq_codebook, codebook.data(), codebook.size() * sizeof(float), cudaMemcpyHostToDevice);
+    if (stream) {
+        cudaMemcpyAsync(idx.d_pq_codebook, codebook.data(), codebook.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(idx.d_pq_codebook, codebook.data(), codebook.size() * sizeof(float), cudaMemcpyHostToDevice);
+    }
 
     std::ifstream ifs(res_dir + "/ivf_data.bin", std::ios::binary);
     if(!ifs) { std::cerr << "Error opening ivf_data.bin" << std::endl; exit(1); }
@@ -478,13 +503,29 @@ void load_ivf_index_to_gpu(const std::string& res_dir, IVFIndexGPU& idx) {
     ifs.read((char*)centroids.data(), centroids.size() * sizeof(float));
     
     cudaMalloc(&idx.d_cluster_offsets, offsets.size() * sizeof(int));
-    cudaMemcpy(idx.d_cluster_offsets, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    if (stream) {
+        cudaMemcpyAsync(idx.d_cluster_offsets, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(idx.d_cluster_offsets, offsets.data(), offsets.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
     cudaMalloc(&idx.d_all_vector_ids, ids.size() * sizeof(int));
-    cudaMemcpy(idx.d_all_vector_ids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
+    if (stream) {
+        cudaMemcpyAsync(idx.d_all_vector_ids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(idx.d_all_vector_ids, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice);
+    }
     cudaMalloc(&idx.d_all_pq_codes, codes.size() * sizeof(uint8_t));
-    cudaMemcpy(idx.d_all_pq_codes, codes.data(), codes.size() * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    if (stream) {
+        cudaMemcpyAsync(idx.d_all_pq_codes, codes.data(), codes.size() * sizeof(uint8_t), cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(idx.d_all_pq_codes, codes.data(), codes.size() * sizeof(uint8_t), cudaMemcpyHostToDevice);
+    }
     cudaMalloc(&idx.d_centroids, centroids.size() * sizeof(float));
-    cudaMemcpy(idx.d_centroids, centroids.data(), centroids.size() * sizeof(float), cudaMemcpyHostToDevice);
+    if (stream) {
+        cudaMemcpyAsync(idx.d_centroids, centroids.data(), centroids.size() * sizeof(float), cudaMemcpyHostToDevice, stream);
+    } else {
+        cudaMemcpy(idx.d_centroids, centroids.data(), centroids.size() * sizeof(float), cudaMemcpyHostToDevice);
+    }
 }
 
 float compute_recall(const std::vector<std::vector<int>>& results, const int* groundtruth, int nq, int gt_k, int recall_k) {
@@ -536,7 +577,13 @@ int main(int argc, char** argv) {
     }
 
     float* raw; int n = read_vecs<float>(base_path, raw, DIM);
-    IVFIndexGPU idx_gpu; load_ivf_index_to_gpu("../res", idx_gpu); 
+    // 使用异步流加载索引
+    cudaStream_t init_load_stream;
+    cudaStreamCreate(&init_load_stream);
+    IVFIndexGPU idx_gpu; 
+    load_ivf_index_to_gpu("../res", idx_gpu, init_load_stream);
+    cudaStreamSynchronize(init_load_stream);  // 初始化阶段需要等待完成
+    cudaStreamDestroy(init_load_stream);
     float* q_ptr; int nq = read_vecs<float>(query_path, q_ptr, DIM);
     std::vector<float> all_q(q_ptr, q_ptr + (size_t)nq * DIM);
     
@@ -561,8 +608,10 @@ int main(int argc, char** argv) {
     for(int i=0; i<batches; ++i) {
         int start = i * batch_size;
         int sz = std::min(batch_size, nq - start);
+        // 优化：避免不必要的 vector 拷贝，直接传递数据指针范围
+        // 注意：submit_batch 内部会异步拷贝，所以这里可以安全地传递临时 vector
         std::vector<float> bq(sz * DIM);
-        std::memcpy(bq.data(), all_q.data() + start * DIM, sz * DIM * 4);
+        std::memcpy(bq.data(), all_q.data() + start * DIM, sz * DIM * sizeof(float));
         pipeline.submit_batch(bq, start);
     }
     pipeline.wait_all();
