@@ -531,11 +531,26 @@ void load_ivf_index_to_gpu(const std::string& res_dir, IVFIndexGPU& idx, cudaStr
 float compute_recall(const std::vector<std::vector<int>>& results, const int* groundtruth, int nq, int gt_k, int recall_k) {
     int total_hits = 0;
     for (int i = 0; i < nq; ++i) {
+        // 构建该 query 的 GT 集合
         std::unordered_set<int> gt_set;
-        for (int j = 0; j < gt_k; ++j) gt_set.insert(groundtruth[i * gt_k + j]);
+        for (int j = 0; j < gt_k; ++j) {
+            gt_set.insert(groundtruth[i * gt_k + j]);
+        }
+
+        // 为了防止返回结果中存在重复 ID 被重复计数，
+        // 这里对预测结果进行去重，只对每个唯一 ID 统计一次命中。
+        std::unordered_set<int> seen_pred_ids;
         int hits = 0;
         int check_k = std::min(recall_k, (int)results[i].size());
-        for (int j = 0; j < check_k; ++j) if (gt_set.count(results[i][j])) hits++;
+        for (int j = 0; j < check_k; ++j) {
+            int pred_id = results[i][j];
+            // 只在第一次出现该 ID 时参与统计
+            if (seen_pred_ids.insert(pred_id).second) {
+                if (gt_set.count(pred_id)) {
+                    hits++;
+                }
+            }
+        }
         total_hits += hits;
     }
     return (float)total_hits / (nq * recall_k);
